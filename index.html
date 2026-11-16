@@ -1,0 +1,128 @@
+<!doctype html>
+<html lang="tr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex">
+<meta name="referrer" content="no-referrer">
+<title>RemoteHub Bağlan</title>
+<style>
+:root{--bg:#0f1115;--panel:#181b22;--line:#2a2f3a;--text:#e6e8ee;--muted:#8b93a7;--accent:#4f8cff;--ok:#2fbf71;--bad:#e5484d;color-scheme:dark}
+*{box-sizing:border-box}
+html,body{margin:0;min-height:100%;background:var(--bg);color:var(--text);font:15px/1.45 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
+main{min-height:100vh;display:flex;align-items:center;justify-content:center;padding:24px max(16px,env(safe-area-inset-left,0px)) 24px max(16px,env(safe-area-inset-right,0px))}
+.card{width:100%;max-width:420px;background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:22px;display:flex;flex-direction:column;gap:12px}
+h1{margin:0;font-size:20px}
+p{margin:0;color:var(--muted)}
+input[type=text],input[type=password]{width:100%;height:46px;border-radius:8px;border:1px solid var(--line);background:var(--bg);color:var(--text);padding:0 12px;font:16px ui-monospace,Consolas,monospace;letter-spacing:.5px}
+input:focus,button:focus-visible,a:focus-visible{outline:2px solid var(--accent);outline-offset:1px}
+label{display:flex;gap:8px;align-items:center;color:var(--muted);font-size:14px}
+button,.go{height:46px;border:0;border-radius:8px;background:var(--accent);color:#fff;font:600 15px system-ui,sans-serif;cursor:pointer;display:flex;align-items:center;justify-content:center;text-decoration:none}
+button:disabled{opacity:.6;cursor:default}
+#msg{min-height:20px;color:var(--bad)}
+#found{display:flex;flex-direction:column;gap:10px;border-top:1px solid var(--line);padding-top:12px}
+#found .row{display:flex;justify-content:space-between;gap:12px;font-variant-numeric:tabular-nums}
+#found .row span:first-child{color:var(--muted)}
+.go{background:var(--ok)}
+[hidden]{display:none!important}
+</style>
+</head>
+<body>
+<main>
+  <form class="card" id="f" autocomplete="off">
+    <h1>RemoteHub</h1>
+    <p>PC'nin anahtarını gir; güncel adresi bulup bağlanırım.</p>
+    <input id="key" type="password" placeholder="XXXX-XXXX-XXXX-XXXX-..." spellcheck="false" autocapitalize="characters" autocomplete="off">
+    <label><input id="show" type="checkbox"> Anahtarı göster</label>
+    <label><input id="remember" type="checkbox"> Bu cihazda hatırla (sadece kendi cihazında)</label>
+    <button id="find" type="submit">Adresi bul</button>
+    <div id="msg" role="status"></div>
+    <div id="found" hidden>
+      <div class="row"><span>Bilgisayar</span><strong id="host"></strong></div>
+      <div class="row"><span>Yayınlandı</span><span id="age"></span></div>
+      <a class="go" id="go" href="#" rel="noreferrer">Bağlan →</a>
+    </div>
+  </form>
+</main>
+<script>
+"use strict";
+// remotehub.py ile aynı şema: topic = "rh" + sha256("remotehub:topic:KEY")[:32 hex]
+// mesaj = base64url(nonce16 | ct | hmac32), HMAC-SHA256 ile akış şifresi (encrypt-then-MAC)
+const NTFY = 'https://ntfy.sh';
+const $ = id => document.getElementById(id);
+const enc = new TextEncoder();
+const norm = k => k.toUpperCase().replace(/[^A-Z2-7]/g, '');
+const fmt = n => (n.match(/.{1,4}/g) || []).join('-');
+const hex = b => [...new Uint8Array(b)].map(x => x.toString(16).padStart(2, '0')).join('');
+const derive = (key, label) => crypto.subtle.digest('SHA-256', enc.encode(`remotehub:${label}:${key}`));
+async function hmac(rawKey, data) {
+  const k = await crypto.subtle.importKey('raw', rawKey, { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
+  return new Uint8Array(await crypto.subtle.sign('HMAC', k, data));
+}
+function b64url(s) {
+  s = s.replace(/-/g, '+').replace(/_/g, '/');
+  while (s.length % 4) s += '=';
+  return Uint8Array.from(atob(s), c => c.charCodeAt(0));
+}
+function eq(a, b) { if (a.length !== b.length) return false; let d = 0; for (let i = 0; i < a.length; i++) d |= a[i] ^ b[i]; return d === 0; }
+async function unseal(key, token) {
+  let raw; try { raw = b64url(token); } catch (e) { return null; }
+  if (raw.length < 48) return null;
+  const nonce = raw.slice(0, 16), ct = raw.slice(16, raw.length - 32), tag = raw.slice(raw.length - 32);
+  const macIn = new Uint8Array(16 + ct.length); macIn.set(nonce); macIn.set(ct, 16);
+  if (!eq(tag, await hmac(await derive(key, 'mac'), macIn))) return null;
+  const ek = await derive(key, 'enc'), out = new Uint8Array(ct.length);
+  for (let ctr = 0, off = 0; off < ct.length; ctr++, off += 32) {
+    const blk = new Uint8Array(20); blk.set(nonce); new DataView(blk.buffer).setUint32(16, ctr);
+    const ks = await hmac(ek, blk);
+    for (let i = 0; i < 32 && off + i < ct.length; i++) out[off + i] = ct[off + i] ^ ks[i];
+  }
+  try { return JSON.parse(new TextDecoder().decode(out)); } catch (e) { return null; }
+}
+async function lookup(key) {
+  const topic = 'rh' + hex(await derive(key, 'topic')).slice(0, 32);
+  const r = await fetch(`${NTFY}/${topic}/json?poll=1&since=24h`, { cache: 'no-store', referrerPolicy: 'no-referrer' });
+  if (!r.ok) throw new Error('ntfy ' + r.status);
+  let best = null;
+  for (const line of (await r.text()).split('\n')) {
+    let ev; try { ev = JSON.parse(line); } catch (e) { continue; }
+    if (ev.event !== 'message') continue;
+    const info = await unseal(key, ev.message || '');
+    if (info && /^https:\/\/[a-z0-9-]+\.trycloudflare\.com$/.test(info.url) && (!best || info.ts > best.ts)) best = info;
+  }
+  return best;
+}
+function store(v) { try { if (v === undefined) return localStorage.getItem('rh_key'); if (v === null) localStorage.removeItem('rh_key'); else localStorage.setItem('rh_key', v); } catch (e) { return null; } }
+function ago(sec) { return sec < 90 ? 'az önce' : sec < 5400 ? `${Math.round(sec / 60)} dk önce` : `${Math.round(sec / 3600)} saat önce`; }
+
+$('show').onchange = () => { $('key').type = $('show').checked ? 'text' : 'password'; };
+$('f').onsubmit = async e => {
+  e.preventDefault();
+  $('found').hidden = true; $('msg').textContent = '';
+  if (!(window.crypto && crypto.subtle)) { $('msg').textContent = 'Bu tarayıcı şifrelemeyi desteklemiyor (https veya güncel tarayıcı gerekli).'; return; }
+  const key = norm($('key').value);
+  if (key.length !== 32) { $('msg').textContent = 'Anahtar 32 karakter olmalı (ör. ABCD-EFGH-...).'; return; }
+  $('find').disabled = true; $('find').textContent = 'Aranıyor...';
+  try {
+    const info = await lookup(key);
+    if (!info) { $('msg').textContent = 'Bu anahtar için adres yok. Host kapalı olabilir veya 12 saattir açılmamış.'; return; }
+    if ($('remember').checked) store(key); else store(null);
+    $('host').textContent = info.host || '?';
+    $('age').textContent = ago(Math.max(0, Date.now() / 1000 - info.ts));
+    $('go').href = `${info.url}/#k=${fmt(key)}`;
+    $('found').hidden = false;
+    $('go').focus();
+  } catch (err) {
+    $('msg').textContent = 'Adres kanalına ulaşılamadı. İnternet bağlantını kontrol et.';
+  } finally {
+    $('find').disabled = false; $('find').textContent = 'Adresi bul';
+  }
+};
+(function init() {
+  const k = store();
+  if (k) { $('key').value = fmt(k); $('remember').checked = true; $('f').requestSubmit(); }
+  else $('key').focus();
+})();
+</script>
+</body>
+</html>
